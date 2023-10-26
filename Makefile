@@ -1,2 +1,2 @@
 knighterrant: knighterrant.c
-	$(CC) -O3 -o $@ $^
+	$(CC) -Wall -O3 -lpthread -o $@ $^

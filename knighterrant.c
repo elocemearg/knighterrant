@@ -4,16 +4,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <getopt.h>
+#include <errno.h>
+#include <error.h>
+#include <pthread.h>
 
-typedef char STEP;
-typedef char SQUARE;
-typedef char LINE;
+typedef int8_t STEP;
+typedef int8_t SQUARE;
+typedef int8_t LINE;
 typedef uint64_t BOARDBITMAP;
 
 const SQUARE INVALID_SQUARE = -1;
 
-bool print_tours = false;
-
+/* If TEST6 is defined, we use a 6*6 board and run in a test mode where we find
+ * all knight's tours, regardless of row/column sum and regardless of starting
+ * square, and output the total number of tours found.
+ *
+ * For a 5*5 board the correct number of tours is 1728, and for a 6*6 board
+ * the correct number of tours is 6637920. Source: htps://oeis.org/A165134
+ */
 //#define TEST6
 
 #define REUSE_POS 1
@@ -25,8 +34,6 @@ bool print_tours = false;
 #endif
 
 #define NUM_SQUARES (BOARD_DIM * BOARD_DIM)
-
-int max_step = NUM_SQUARES;
 
 /* On an 8*8 board, in each 4*4 quadrant, all four rows must add up to 130 and
  * all four columns must add up to 130.
@@ -99,7 +106,7 @@ struct ke_pos {
     short line_sum[NUM_LINES];
 
     /* For each line, the number of visited squares in that line. */
-    char line_count[NUM_LINES];
+    int8_t line_count[NUM_LINES];
 
     /* For each square, the number in that square, or 0 if not yet filled in. */
     STEP square_to_step[NUM_SQUARES];
@@ -120,13 +127,13 @@ struct ke_pos {
      * which are one knight's move away. If sq is visited,
      * adjacent_unvisited[sq] is -1 times the value it had when the square
      * was last unvisited. */
-    char adjacent_unvisited[NUM_SQUARES];
+    int8_t adjacent_unvisited[NUM_SQUARES];
 
     /* Lookup table containing the number of 0s, 1s, 2s, ... etc in the above
      * array. adjacent_unvisited_counts[1], for example, gives the number of
      * unvisited squares which have exactly one knight-adjacent unvisited
      * square. */
-    char adjacent_unvisited_counts[9];
+    int8_t adjacent_unvisited_counts[9];
 
     /* The next number to enter into the grid. */
     STEP next_step;
@@ -136,23 +143,6 @@ struct ke_pos {
 
     /* The bitmap of visited squares. */
     BOARDBITMAP visited;
-};
-
-struct ke_result {
-    /* The number of valid tours up to max_step that we found */
-    long long tours_found;
-
-    /* Number of times we backed out a move because we worked out the
-     * line sums couldn't be met from it */
-    long long sum_opt_elim_count;
-
-    /* Number of times we eliminated a move because a previous sum calculation
-     * forced us to put that number somewhere else. */
-    long long last_space_opt_count;
-
-    /* Highest step number called by the recursive function tour() since we
-     * last output a completed knight's tour. */
-    STEP latest_step_found_since_last_complete_tour;
 };
 
 #ifdef ENFORCE_SUM_RULE
@@ -266,10 +256,202 @@ const short sum_maximums[] = {
 };
 #endif
 
+/* Macros for setting and testing bits in a BOARDBITMAP */
 #define bb_set(bp, sq) *(bp) |= (1ULL << (sq))
 #define bb_unset(bp, sq) *(bp) &= ~(1ULL << (sq))
 #define bb_test(b, sq) (((b) & (1ULL << (sq))) != 0)
 
+void
+precompute(void) {
+    /* square_to_lines[square][0] and square_to_lines[square][1] must contain
+     * the two IDs of the lines which this square is part of. */
+    LINE line = 0;
+    for (int qr = 0; qr < 2; qr++) {
+        for (int qc = 0; qc < 2; qc++) {
+            SQUARE quadrant_top_left = qc * (BOARD_DIM / 2) + qr * (NUM_SQUARES / 2);
+            /* BOARD_DIM / 2 horizontal lines of BOARD_DIM / 2 squares each */
+            for (int r = 0; r < BOARD_DIM / 2; r++) {
+                for (int c = 0; c < BOARD_DIM / 2; c++) {
+                    SQUARE sq = quadrant_top_left + r * BOARD_DIM + c;
+                    square_to_lines[sq][0] = line;
+                    line_to_squares[line][c] = sq;
+                }
+                line++;
+            }
+            /* BOARD_DIM / 2 vertical lines of BOARD_DIM / 2 squares each */
+            for (int c = 0; c < BOARD_DIM / 2; c++) {
+                for (int r = 0; r < BOARD_DIM / 2; r++) {
+                    SQUARE sq = quadrant_top_left + r * BOARD_DIM + c;
+                    square_to_lines[sq][1] = line;
+                    line_to_squares[line][r] = sq;
+                }
+                line++;
+            }
+        }
+    }
+
+    /* moves[s][0..7] must contain all possible knight destination squares
+     * from square s. If there are fewer than eight, pad with INVALID_SQUARE. */
+    for (SQUARE square = 0; square < NUM_SQUARES; square++) {
+        int r = square / BOARD_DIM;
+        int c = square % BOARD_DIM;
+        int m = 0;
+        for (int diry = -1; diry <= 1; diry += 2) {
+            for (int dirx = -1; dirx <= 1; dirx += 2) {
+                for (int a = 0; a < 2; a++) {
+                    int new_r = r, new_c = c;
+                    if (a == 0) {
+                        /* Two vertical, one horizontal */
+                        new_r += 2 * diry;
+                        new_c += dirx;
+                    }
+                    else {
+                        /* Two horizontal, one vertical */
+                        new_r += diry;
+                        new_c += 2 * dirx;
+                    }
+                    if (new_r >= 0 && new_r < BOARD_DIM && new_c >= 0 && new_c < BOARD_DIM) {
+                        SQUARE new_square = (SQUARE) (new_r * BOARD_DIM + new_c);
+                        moves[square][m++] = new_square;
+                        knight_adjacent_squares[square][new_square] = true;
+                    }
+                }
+            }
+        }
+
+        /* Pad out the rest of moves[square] with INVALID_SQUARE */
+        while (m < 8) {
+            moves[square][m++] = INVALID_SQUARE;
+        }
+    }
+}
+
+
+/* Thread handling stuff */
+pthread_mutex_t emit_mutex = PTHREAD_MUTEX_INITIALIZER;
+long long num_tours_found = 0;
+bool show_progress = true;
+
+#define MUTEX_LOCK(m) while (pthread_mutex_lock(m) == EINTR);
+#define MUTEX_UNLOCK(m) pthread_mutex_unlock(m)
+#define CV_WAIT(c, m) pthread_cond_wait(c, m)
+#define CV_SIGNAL(c) pthread_cond_signal(c)
+
+/* Job buffer: meeting point for the main thread and the worker threads.
+ * The main thread will put a job in here (a board position with a knight
+ * having done a small number of steps) and a worker thread will take it
+ * from there. */
+struct job_buffer {
+    pthread_mutex_t mutex;
+    pthread_cond_t empty_cv;
+    pthread_cond_t full_cv;
+
+    int jobs_dequeued;
+    int num_expected_jobs;
+    int num_threads_running;
+    bool full;
+    bool finished;
+    struct ke_pos ke_state;
+};
+
+struct worker_thread {
+    pthread_t thread_id;
+    int thread_index;
+    struct job_buffer *job_buffer;
+};
+
+void
+job_buffer_init(struct job_buffer *buf, int num_threads, int num_expected_jobs) {
+    memset(buf, 0, sizeof(*buf));
+    pthread_mutex_init(&buf->mutex, NULL);
+    pthread_cond_init(&buf->empty_cv, NULL);
+    pthread_cond_init(&buf->full_cv, NULL);
+    buf->num_threads_running = num_threads;
+    buf->num_expected_jobs = num_expected_jobs;
+}
+
+void
+job_buffer_destroy(struct job_buffer *buf) {
+    pthread_mutex_destroy(&buf->mutex);
+    pthread_cond_destroy(&buf->empty_cv);
+    pthread_cond_destroy(&buf->full_cv);
+}
+
+/* Must be called with job_buffer->mutex held */
+void
+update_progress(struct job_buffer *job_buffer) {
+    /* Number of jobs completed is the number of jobs dequeued minus the number
+     * of threads still working. */
+    int progress_pc;
+
+    if (!show_progress)
+        return;
+
+    progress_pc = ((job_buffer->jobs_dequeued - job_buffer->num_threads_running) * 100) / job_buffer->num_expected_jobs;
+    if (progress_pc < 0)
+        progress_pc = 0;
+    MUTEX_LOCK(&emit_mutex);
+    fprintf(stderr, " %10lld tours found   %3d threads running   %3d%%\r",
+            num_tours_found, job_buffer->num_threads_running, progress_pc);
+    MUTEX_UNLOCK(&emit_mutex);
+}
+
+void
+job_buffer_enqueue(void *job_buffer_vp, const struct ke_pos *ke_pos) {
+    struct job_buffer *job_buffer = (struct job_buffer *) job_buffer_vp;
+    MUTEX_LOCK(&job_buffer->mutex);
+    while (job_buffer->full) {
+        CV_WAIT(&job_buffer->empty_cv, &job_buffer->mutex);
+    }
+
+    /* Buffer is empty. Copy our board position in to it. */
+    if (ke_pos == NULL) {
+        /* No new work - we've finished. */
+        job_buffer->finished = true;
+    }
+    else {
+        job_buffer->ke_state = *ke_pos;
+    }
+
+    /* Indicate the buffer is full and wake up anything waiting for work. */
+    job_buffer->full = true;
+    CV_SIGNAL(&job_buffer->full_cv);
+
+    MUTEX_UNLOCK(&job_buffer->mutex);
+}
+
+void
+job_buffer_finish(struct job_buffer *buf) {
+    job_buffer_enqueue(buf, NULL);
+}
+
+bool
+job_buffer_dequeue(struct job_buffer *job_buffer, struct ke_pos *returned_state) {
+    bool job_dequeued = false;
+    MUTEX_LOCK(&job_buffer->mutex);
+    while (!job_buffer->full) {
+        CV_WAIT(&job_buffer->full_cv, &job_buffer->mutex);
+    }
+
+    /* Buffer is full. Take the payload if there is one, or we've finished. */
+    if (!job_buffer->finished) {
+        *returned_state = job_buffer->ke_state;
+        job_dequeued = true;
+    }
+    job_buffer->full = false;
+    if (job_dequeued) {
+        job_buffer->jobs_dequeued++;
+        if (show_progress) {
+            update_progress(job_buffer);
+        }
+    }
+    CV_SIGNAL(&job_buffer->empty_cv);
+    MUTEX_UNLOCK(&job_buffer->mutex);
+    return job_dequeued;
+}
+
+/* Functions for adjusting the adjacent_unvisited and adjacent_unvisited_counts
+ * arrays. */
 void
 decrement_adjacent_unvisited(struct ke_pos *pos, SQUARE square) {
     if (!bb_test(pos->visited, square)) {
@@ -350,7 +532,6 @@ make_step(struct ke_pos *pos, SQUARE square) {
 
 void
 ke_pos_init(struct ke_pos *pos, SQUARE initial_square) {
-    static const SQUARE corners[] = { 0, BOARD_DIM - 1, NUM_SQUARES - BOARD_DIM, NUM_SQUARES - 1 };
     memset(pos, 0, sizeof(*pos));
     for (SQUARE sq = 0; sq < NUM_SQUARES; sq++) {
         pos->adjacent_unvisited[sq] = 0;
@@ -412,7 +593,7 @@ print_bottom_row_border() {
 }
 
 void
-print_tour(struct ke_pos *pos) {
+print_tour(const struct ke_pos *pos) {
     print_top_row_border();
     for (int r = 0; r < BOARD_DIM; r++) {
         if (r > 0) {
@@ -434,7 +615,7 @@ print_tour(struct ke_pos *pos) {
 }
 
 void
-check_tour(struct ke_pos *pos) {
+check_tour(const struct ke_pos *pos) {
     /* Check that every square has been visited */
 #if BOARD_DIM == 8
     assert(pos->visited == (BOARDBITMAP) -1);
@@ -464,32 +645,33 @@ check_tour(struct ke_pos *pos) {
 }
 
 void
-tour(struct ke_pos *pos, struct ke_result *result) {
+emit_completed_tour(void *cookie, const struct ke_pos *completed_state) {
+    MUTEX_LOCK(&emit_mutex);
+    num_tours_found++;
+#if BOARD_DIM == 8
+    printf("\nFound tour #%lld...\n", num_tours_found);
+    print_tour(completed_state);
+#endif
+    check_tour(completed_state);
+    MUTEX_UNLOCK(&emit_mutex);
+}
+
+void
+tour(struct ke_pos *pos, int max_steps,
+        void (*complete_callback)(void *cookie, const struct ke_pos *completed_state), void *cookie) {
     SQUARE current_pos = pos->pos;
     SQUARE *move_array;
     SQUARE singleton_move;
     int num_moves;
     SQUARE required_square;
 
-    if (pos->next_step - 1 > result->latest_step_found_since_last_complete_tour) {
-#if BOARD_DIM == 8
-        fprintf(stderr, " %2d/%2d\r", (int) pos->next_step - 1, max_step);
-#endif
-        result->latest_step_found_since_last_complete_tour = pos->next_step - 1;
-        /*if (result->latest_step_found_since_last_complete_tour == 42) {
-            print_tour(pos);
-        }*/
-    }
-
-    if (pos->next_step > max_step) {
-        /* We have found a complete knight's tour. Output it and return. */
-        result->tours_found++;
-        if (print_tours) {
-            printf("Found tour #%lld\n", result->tours_found);
-            print_tour(pos);
-            check_tour(pos);
-            result->latest_step_found_since_last_complete_tour = 0;
-        }
+    if (pos->next_step > max_steps) {
+        /* We've already taken max_steps steps, so emit our tour using the
+         * callback function. If this was called by the main thread it will
+         * enqueue this state to a worker to search the rest of the tree from
+         * this point. Otherwise, we are a worker thread and we've found a
+         * complete knight's tour, so this will emit it. */
+        complete_callback(cookie, pos);
         return;
     }
 
@@ -591,7 +773,7 @@ tour(struct ke_pos *pos, struct ke_result *result) {
             }
 
             if (invalid) {
-                result->sum_opt_elim_count++;
+                //sum_opt_elim_count++;
                 break;
             }
 #ifdef LAST_SPACE_OPTIMISATION
@@ -608,7 +790,7 @@ tour(struct ke_pos *pos, struct ke_result *result) {
                         STEP forced_step_no = LINE_SUM - new_sum;
                         if (forced_step_no < 1 || forced_step_no > NUM_SQUARES) {
                             invalid = true;
-                            result->last_space_opt_count++;
+                            //last_space_opt_count++;
                             printf("forced_step_no %d? sq %d, dest %d\n", (int) forced_step_no, (int) sq, (int) dest);
                             break;
                         }
@@ -618,7 +800,7 @@ tour(struct ke_pos *pos, struct ke_result *result) {
                             /* This step number has already been required
                              * someplace else! */
                             invalid = true;
-                            result->last_space_opt_count++;
+                            //last_space_opt_count++;
                             break;
                         }
 
@@ -629,7 +811,7 @@ tour(struct ke_pos *pos, struct ke_result *result) {
                         LINE other_line = (square_to_lines[sq][0] == line ? square_to_lines[sq][1] : square_to_lines[sq][0]);
                         if (pos->line_count[other_line] == LINE_LENGTH - 1 && pos->line_sum[other_line] + forced_step_no != LINE_SUM) {
                             invalid = true;
-                            result->last_space_opt_count++;
+                            //last_space_opt_count++;
                             break;
                         }
 
@@ -676,7 +858,7 @@ tour(struct ke_pos *pos, struct ke_result *result) {
             make_step(next_pos_p, dest);
 
             /* Recurse */
-            tour(next_pos_p, result);
+            tour(next_pos_p, max_steps, complete_callback, cookie);
 
 #ifdef REUSE_POS
             /* Unmake the step, putting pos back how it was */
@@ -697,112 +879,182 @@ tour(struct ke_pos *pos, struct ke_result *result) {
     }
 }
 
+/* A worker thread.
+ *
+ * We'll keep dequeueing jobs (struct ke_pos of a partial tour) from the
+ * job buffer, doing each job (search all possible moves from that position),
+ * until there are no more jobs (job_buffer_dequeue() returns false).
+ */
+void *
+ke_worker_thread(void *arg) {
+    struct worker_thread *context = (struct worker_thread *) arg;
+    struct ke_pos position;
+
+    while (job_buffer_dequeue(context->job_buffer, &position)) {
+        /* Search from this position up to NUM_SQUARES steps */
+        tour(&position, NUM_SQUARES, emit_completed_tour, NULL);
+    }
+    MUTEX_LOCK(&context->job_buffer->mutex);
+    context->job_buffer->num_threads_running--;
+    update_progress(context->job_buffer);
+    MUTEX_UNLOCK(&context->job_buffer->mutex);
+    return NULL;
+}
+
+/* Simple callback to increment an integer, called to get the number of
+ * N-step tours from a starting position. We use this with tour() in the main
+ * thread so we know how many jobs will be given to workers, so we can display
+ * a progress percentage. */
+static void count(void *vp, const struct ke_pos *pos) {
+    (*(int *) vp)++;
+}
+
 void
-precompute(void) {
-    /* square_to_lines[square][0] and square_to_lines[square][1] contain
-     * IDs of four-element lines which this square is part of. */
-    LINE line = 0;
-    for (int qr = 0; qr < 2; qr++) {
-        for (int qc = 0; qc < 2; qc++) {
-            SQUARE quadrant_top_left = qc * (BOARD_DIM / 2) + qr * (NUM_SQUARES / 2);
-            /* BOARD_DIM / 2 horizontal lines of BOARD_DIM / 2 squares each */
-            for (int r = 0; r < BOARD_DIM / 2; r++) {
-                for (int c = 0; c < BOARD_DIM / 2; c++) {
-                    SQUARE sq = quadrant_top_left + r * BOARD_DIM + c;
-                    square_to_lines[sq][0] = line;
-                    line_to_squares[line][c] = sq;
-                }
-                line++;
-            }
-            /* BOARD_DIM / 2 vertical lines of BOARD_DIM / 2 squares each */
-            for (int c = 0; c < BOARD_DIM / 2; c++) {
-                for (int r = 0; r < BOARD_DIM / 2; r++) {
-                    SQUARE sq = quadrant_top_left + r * BOARD_DIM + c;
-                    square_to_lines[sq][1] = line;
-                    line_to_squares[line][r] = sq;
-                }
-                line++;
-            }
-        }
-    }
-
-    /* moves[s][0..7] contains all possible knight destination squares from s */
-    for (SQUARE square = 0; square < NUM_SQUARES; square++) {
-        int r = square / BOARD_DIM;
-        int c = square % BOARD_DIM;
-        int m = 0;
-        for (int diry = -1; diry <= 1; diry += 2) {
-            for (int dirx = -1; dirx <= 1; dirx += 2) {
-                for (int a = 0; a < 2; a++) {
-                    int new_r = r, new_c = c;
-                    if (a == 0) {
-                        /* Two vertical, one horizontal */
-                        new_r += 2 * diry;
-                        new_c += dirx;
-                    }
-                    else {
-                        /* Two horizontal, one vertical */
-                        new_r += diry;
-                        new_c += 2 * dirx;
-                    }
-                    if (new_r >= 0 && new_r < BOARD_DIM && new_c >= 0 && new_c < BOARD_DIM) {
-                        SQUARE new_square = (SQUARE) (new_r * BOARD_DIM + new_c);
-                        moves[square][m++] = new_square;
-                        knight_adjacent_squares[square][new_square] = true;
-                    }
-                }
-            }
-        }
-
-        /* Pad out the rest of moves[square] with INVALID_SQUARE */
-        while (m < 8) {
-            moves[square][m++] = INVALID_SQUARE;
-        }
-    }
+print_help(FILE *f) {
+    fprintf(f, "knighterrant - find magic knight's tours\n");
+#if BOARD_DIM != 8
+    fprintf(f, "This is a test build which will instead count all the ordinary knight's tours\n"
+            "on a %d*%d board, including rotations and reflections.\n", BOARD_DIM, BOARD_DIM);
+#endif
+    fprintf(f, "\n");
+    fprintf(f, "Usage: knighterrant [options]\n");
+    fprintf(f, "Options:\n");
+    fprintf(f, "    -q        Don't show progress output.\n");
+    fprintf(f, "    -s <N>    Search N steps deep before handing the state to a worker thread.\n");
+    fprintf(f, "    -t <N>    Use N worker threads. If N is 0, -s has no effect.\n");
 }
 
 int main(int argc, char **argv) {
-    struct ke_result result;
-    int start_square = 0;
+    SQUARE start_square = 0;
+    int num_threads = 4;
+    int steps_before_parallelism = 4;
 #if BOARD_DIM == 8
-    int num_start_squares = 1;
+    /* Only start on squares 0, 8, 16 and 24, the four squares in the top half
+     * of the leftmost column. */
+    int8_t start_square_step = 8;
+    SQUARE last_square = 24;
 #else
-    int num_start_squares = NUM_SQUARES;
+    /* Test mode: iterate over every square. */
+    int8_t start_square_step = 1;
+    SQUARE last_square = NUM_SQUARES - 1;
 #endif
+    struct worker_thread *worker_threads = NULL;
+    struct job_buffer job_buffer;
+    int num_expected_jobs = 0;
+    void (*tour_callback)(void *, const struct ke_pos *);
+    void *tour_callback_cookie;
+    int c;
 
-    if (argc > 1) {
-        start_square = atoi(argv[1]);
-        if (start_square < 0 || start_square >= NUM_SQUARES) {
-            fprintf(stderr, "invalid start_square\n");
-            exit(1);
+    while ((c = getopt(argc, argv, "t:s:hq")) != -1) {
+        switch (c) {
+            case 't':
+                num_threads = atoi(optarg);
+                break;
+
+            case 's':
+                steps_before_parallelism = atoi(optarg);
+                break;
+
+            case 'h':
+                print_help(stdout);
+                exit(0);
+                break;
+
+            case 'q':
+                show_progress = false;
+                break;
+
+            default:
+                exit(1);
         }
-        num_start_squares = 1;
     }
 
+    /* Precompute various useful global lookup tables */
     precompute();
-    memset(&result, 0, sizeof(result));
 
 #if BOARD_DIM == 8
-    if (max_step == NUM_SQUARES)
-        print_tours = true;
+    /* If it's an 8*8 board, we make certain assumptions that we're not
+     * finding all tours, we're only finding those that start on the leftmost
+     * column and end on the rightmost column. */
     if (start_square % 8 != 0) {
         fprintf(stderr, "start square must be a multiple of 8 (left column of board)\n");
         exit(1);
     }
 #endif
 
-    printf("Using board size %d*%d\n", BOARD_DIM, BOARD_DIM);
+    printf("Using board size %d*%d and %d threads\n", BOARD_DIM, BOARD_DIM, num_threads);
 
-    for (SQUARE start = start_square; start < start_square + num_start_squares; ++start) {
+    if (num_threads == 0) {
+        /* Do everything sequentially */
+        steps_before_parallelism = NUM_SQUARES;
+        tour_callback = emit_completed_tour;
+        tour_callback_cookie = NULL;
+    }
+    else {
+        /* Do it sequentially up to steps_before_parallelism steps, then
+         * hand off the state from there to a worker thread */
+        tour_callback = job_buffer_enqueue;
+        tour_callback_cookie = &job_buffer;
+
+        if (show_progress) {
+            /* Count how many paths there are up to steps_before_parallelism
+             * steps, so our progress output gives an accurate percentage of
+             * jobs dequeued / total jobs to do. */
+            for (SQUARE start = start_square; start <= last_square; start += start_square_step) {
+                struct ke_pos pos;
+                ke_pos_init(&pos, start);
+                tour(&pos, steps_before_parallelism, count, &num_expected_jobs);
+            }
+        }
+    }
+
+    if (num_threads > 0) {
+        /* Start our worker threads */
+        worker_threads = malloc(sizeof(struct worker_thread) * num_threads);
+        memset(worker_threads, 0, sizeof(struct worker_thread) * num_threads);
+        job_buffer_init(&job_buffer, num_threads, num_expected_jobs);
+        for (int i = 0; i < num_threads; i++) {
+            int ret;
+            worker_threads[i].job_buffer = &job_buffer;
+            worker_threads[i].thread_index = i;
+            ret = pthread_create(&worker_threads[i].thread_id, NULL, ke_worker_thread, &worker_threads[i]);
+            if (ret != 0) {
+                error(1, ret, "pthread_create");
+            }
+        }
+    }
+
+    for (SQUARE start = start_square; start <= last_square; start += start_square_step) {
+        /* Position the knight on our starting square */
         struct ke_pos pos;
         ke_pos_init(&pos, start);
-        tour(&pos, &result);
+
+        /* Find all the tour prefixes up to steps_before_parallelism steps
+         * long, and hand each such state to a worker thread. Or if num_threads
+         * is zero, steps_before_parallelism is the total number of steps,
+         * we never hand anything to a worker thread, and tour_callback prints
+         * the completed tour. */
+        tour(&pos, steps_before_parallelism, tour_callback, tour_callback_cookie);
+    }
+
+    if (num_threads > 0) {
+        /* Tell the threads there's no more work to do */
+        for (int i = 0; i < num_threads; i++) {
+            job_buffer_finish(&job_buffer);
+        }
+
+        for (int i = 0; i < num_threads; i++) {
+            pthread_join(worker_threads[i].thread_id, NULL);
+        }
+        free(worker_threads);
+        update_progress(&job_buffer);
+        job_buffer_destroy(&job_buffer);
     }
 
     printf("\n");
-    printf("Found %lld tours of length %d\n", result.tours_found, max_step);
-    //printf("sum_opt_elim_count %lld\n", result.sum_opt_elim_count);
-    //printf("last_space_opt_count %lld\n", result.last_space_opt_count);
+    printf("Found %lld tours\n", num_tours_found);
+    //printf("sum_opt_elim_count %lld\n", sum_opt_elim_count);
+    //printf("last_space_opt_count %lld\n", last_space_opt_count);
 
     return 0;
 }
