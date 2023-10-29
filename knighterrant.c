@@ -16,23 +16,53 @@ typedef uint64_t BOARDBITMAP;
 
 const SQUARE INVALID_SQUARE = -1;
 
-/* If TEST6 is defined, we use a 6*6 board and run in a test mode where we find
- * all knight's tours, regardless of row/column sum and regardless of starting
- * square, and output the total number of tours found.
+/* If REUSE_POS is true, then we reuse the same struct ke_pos object for each
+ * recursive step, unmaking the move when we've finished. Otherwise, we copy
+ * the ke_pos object to a new object and pass that down to the next step. */
+#ifndef REUSE_POS
+    #define REUSE_POS 1
+#endif
+
+/* If TOUR_TEST is true, we use a 6*6 board and run in a test mode where we
+ * find all knight's tours, regardless of row/column sum and regardless of
+ * starting square, and output the total number of tours found.
  *
  * For a 5*5 board the correct number of tours is 1728, and for a 6*6 board
  * the correct number of tours is 6637920. Source: htps://oeis.org/A165134
  */
-//#define TEST6
-
-#define REUSE_POS 1
-
-#ifdef TEST6
-#define BOARD_DIM 6
-#else
-#define BOARD_DIM 8
+#ifndef TOUR_TEST
+    #define TOUR_TEST 0
 #endif
 
+#if TOUR_TEST
+    /* 6*6 board, test mode */
+    #ifndef BOARD_DIM
+        #define BOARD_DIM 6
+    #endif
+    #define ENFORCE_SUM_RULE 0
+    #define LAST_SPACE_OPTIMISATION 0
+#else
+    /* 8*8 board, enforce sum rule */
+    #define BOARD_DIM 8
+
+    /* If ENFORCE_SUM_RULE is true, then we enforce that the numbers in each
+     * half-row and half-column sum to LINE_SUM, defined below. We always
+     * enforce this unless TOUR_TEST is true. */
+    #define ENFORCE_SUM_RULE 1
+
+    /* If LAST_SPACE_OPTIMISATION is true, then when a line has only one more
+     * empty square in it, we pencil in what number must go there, which
+     * restricts our options later on and helps rule out fruitless paths. */
+    #define LAST_SPACE_OPTIMISATION 1
+#endif
+
+/* If RESTRICT_START_AND_END is true, the tour must start in the leftmost
+ * column and finish in the rightmost column. */
+#ifndef RESTRICT_START_AND_END
+#define RESTRICT_START_AND_END 1
+#endif
+
+/* Number of squares on the board */
 #define NUM_SQUARES (BOARD_DIM * BOARD_DIM)
 
 /* On an 8*8 board, in each 4*4 quadrant, all four rows must add up to 130 and
@@ -40,27 +70,38 @@ const SQUARE INVALID_SQUARE = -1;
  * We'll call these four-element rows "lines". There are 32 of them.
  * Each square is on two different lines. */
 
-/* BOARD_DIM lines per quadrant */
+/* BOARD_DIM lines per quadrant, four quadrants on the board */
 #define NUM_LINES (BOARD_DIM * 4)
 
-#define LINE_SUM (NUM_SQUARES * 2 + 2)
+/* Each half-row and half column must sum to half the magic constant for the
+ * whole square. The magic constant for the whole square is the sum of the
+ * numbers from 1 to NUM_SQUARES divided by the number of rows:
+ *    (((1 + NUM_SQUARES) * NUM_SQUARES) / 2) / BOARD_DIM
+ */
+#define LINE_SUM (((((1 + NUM_SQUARES) * NUM_SQUARES) / 2) / BOARD_DIM)) / 2
 #define LINE_LENGTH (BOARD_DIM / 2)
 
+/* Define the set of squares on which the tour is permitted to finish. */
 #if BOARD_DIM == 8
-/* Tour must end on the right hand side */
-#define END_SQUARE_MASK 0x8080808080808080ULL
-#define ENFORCE_SUM_RULE 1
-#define LAST_SPACE_OPTIMISATION 1
+    #if RESTRICT_START_AND_END
+        /* Tour must end on the right hand side */
+        #define END_SQUARE_MASK 0x8080808080808080ULL
+    #else
+        /* Tour may end anywhere */
+        #define END_SQUARE_MASK 0xffffffffffffffffULL
+    #endif
 #else
-#define END_SQUARE_MASK 0xffffffffffffffffULL
+    #define END_SQUARE_MASK 0xffffffffffffffffULL
 #endif
 
-#define UTF8_BOX_LINES 1
+#ifndef UTF8_BOX_LINES
+    #define UTF8_BOX_LINES 1
+#endif
 
 #define IS_END_SQUARE(sq) (bb_test(END_SQUARE_MASK, (sq)))
 
 /* Characters with which to draw the grid when we output a completed tour */
-#ifdef UTF8_BOX_LINES
+#if UTF8_BOX_LINES
 #define BOX_TOP_LEFT "┌"
 #define BOX_TOP_RIGHT "┐"
 #define BOX_T "┬"
@@ -115,7 +156,7 @@ struct ke_pos {
      * that step number. */
     SQUARE step_to_square[NUM_SQUARES + 1];
 
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
     /* If we fill in a number leaving only one space left on a line, we
      * already know what that number must be.
      * step_to_square_required_by_sum[step] = sq if some future step number
@@ -145,7 +186,7 @@ struct ke_pos {
     BOARDBITMAP visited;
 };
 
-#ifdef ENFORCE_SUM_RULE
+#if ENFORCE_SUM_RULE
 /* sum_minimums:
  *
  * The array index is the number of unfilled spaces in a horizontal
@@ -172,8 +213,9 @@ const short sum_minimums[] = {
 #if BOARD_DIM == 8
     /* Special case for an 8x8 board...
      *
-     * If a 4x4 quadrant has a line with two numbers filled in, these two
-     * numbers must sum to at least 8.
+     * If a 4x4 quadrant has a line with two numbers filled in, and we must
+     * start on the left and finish on the right (RESTRICT_START_AND_END),
+     * these two numbers must sum to at least 8.
      *
      * Proof:
      *
@@ -219,7 +261,11 @@ const short sum_minimums[] = {
      *     
      * Therefore, any two numbers in a line of four must sum to at least 8,
      * and, by symmetry, at most 122. */
+#if RESTRICT_START_AND_END
     8,
+#else
+    0,
+#endif
 #else
     /* Non-8*8 board: do not enforce a minimum for sum_minimums[2]. */
     0,
@@ -243,7 +289,11 @@ const short sum_maximums[] = {
     /* sum_maximums[2]: see argument above for the 8*8 case, no maximum for
      * a non-8*8 case. */
 #if BOARD_DIM == 8
+#if RESTRICT_START_AND_END
     122,
+#else
+    32767,
+#endif
 #else
     32767,
 #endif
@@ -330,6 +380,7 @@ precompute(void) {
 /* Thread handling stuff */
 pthread_mutex_t emit_mutex = PTHREAD_MUTEX_INITIALIZER;
 long long num_tours_found = 0;
+long long num_closed_tours_found = 0;
 bool show_progress = true;
 
 #define MUTEX_LOCK(m) while (pthread_mutex_lock(m) == EINTR);
@@ -548,7 +599,7 @@ ke_pos_init(struct ke_pos *pos, SQUARE initial_square) {
     }
 
     for (STEP step = 0; step <= NUM_SQUARES; step++) {
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
         pos->step_to_square_required_by_sum[step] = INVALID_SQUARE;
 #endif
         pos->step_to_square[step] = INVALID_SQUARE;
@@ -623,7 +674,7 @@ check_tour(const struct ke_pos *pos) {
     assert(pos->visited == (1ULL << NUM_SQUARES) - 1);
 #endif
 
-#ifdef ENFORCE_SUM_RULE
+#if ENFORCE_SUM_RULE
     /* Check that every half-row and half-column sums to LINE_SUM */
     for (LINE line = 0; line < NUM_LINES; line++) {
         short sum = 0;
@@ -648,9 +699,15 @@ void
 emit_completed_tour(void *cookie, const struct ke_pos *completed_state) {
     MUTEX_LOCK(&emit_mutex);
     num_tours_found++;
+    if (knight_adjacent_squares[completed_state->step_to_square[1]][completed_state->step_to_square[NUM_SQUARES]]) {
+        /* The ending square is a knight's move from the starting square, so
+         * this is also a closed tour */
+        num_closed_tours_found++;
+    }
 #if BOARD_DIM == 8
     printf("\nFound tour #%lld...\n", num_tours_found);
     print_tour(completed_state);
+    fflush(stdout);
 #endif
     check_tour(completed_state);
     MUTEX_UNLOCK(&emit_mutex);
@@ -663,7 +720,9 @@ tour(struct ke_pos *pos, int max_steps,
     SQUARE *move_array;
     SQUARE singleton_move;
     int num_moves;
+#if LAST_SPACE_OPTIMISATION
     SQUARE required_square;
+#endif
 
     if (pos->next_step > max_steps) {
         /* We've already taken max_steps steps, so emit our tour using the
@@ -703,7 +762,7 @@ tour(struct ke_pos *pos, int max_steps,
             num_moves = 1;
         }
     }
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
     /* If a previous sum calculation requires us to move to a particular square
      * on this step, enforce that now. */
     required_square = pos->step_to_square_required_by_sum[pos->next_step];
@@ -730,8 +789,10 @@ tour(struct ke_pos *pos, int max_steps,
     /* Iterate over all possible destinations from the current position */
     for (int move_idx = 0; move_idx < num_moves; move_idx++) {
         bool invalid = false;
+#if LAST_SPACE_OPTIMISATION
         SQUARE sum_force_square[2] = { INVALID_SQUARE, INVALID_SQUARE };
         STEP sum_force_step[2] = {0, 0};
+#endif
 
         SQUARE dest = move_array[move_idx];
         if (dest == INVALID_SQUARE) {
@@ -750,7 +811,7 @@ tour(struct ke_pos *pos, int max_steps,
             continue;
         }
 
-#ifdef ENFORCE_SUM_RULE
+#if ENFORCE_SUM_RULE
         /* For each of the two lines shared by this square, check that the
          * line's sum so far doesn't stray outside the relevant limits. */
         for (int line_index = 0; !invalid && line_index < 2; line_index++) {
@@ -776,7 +837,7 @@ tour(struct ke_pos *pos, int max_steps,
                 //sum_opt_elim_count++;
                 break;
             }
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
             else if (pos->line_count[line] == LINE_LENGTH - 2) {
                 /* If we place this number here, this line will only have one
                  * more space in it. We can now trivially work out what that
@@ -834,14 +895,14 @@ tour(struct ke_pos *pos, int max_steps,
         }
 #endif
         if (!invalid) {
-#ifdef REUSE_POS
+#if REUSE_POS
             struct ke_pos *next_pos_p = pos;
 #else
             struct ke_pos next_pos = *pos;
             struct ke_pos *next_pos_p = &next_pos;
 #endif
 
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
             /* If the sums of any quadrant lines dictated that a particular
              * square must contain a particular number, enforce that now. */
             for (int line_index = 0; line_index < 2; line_index++) {
@@ -860,11 +921,11 @@ tour(struct ke_pos *pos, int max_steps,
             /* Recurse */
             tour(next_pos_p, max_steps, complete_callback, cookie);
 
-#ifdef REUSE_POS
+#if REUSE_POS
             /* Unmake the step, putting pos back how it was */
             unmake_step(pos);
 
-#ifdef LAST_SPACE_OPTIMISATION
+#if LAST_SPACE_OPTIMISATION
             /* Undo any modification we just made to step_to_square_required_by_sum */
             for (int line_index = 0; line_index < 2; line_index++) {
                 SQUARE sq = sum_force_square[line_index];
@@ -911,11 +972,46 @@ static void count(void *vp, const struct ke_pos *pos) {
 
 void
 print_help(FILE *f) {
-    fprintf(f, "knighterrant - find magic knight's tours\n");
-#if BOARD_DIM != 8
+    fprintf(f, "knighterrant - find nested semimagic knight's tours\n");
+
+#if TOUR_TEST
+    fprintf(f, "\n");
     fprintf(f, "This is a test build which will instead count all the ordinary knight's tours\n"
             "on a %d*%d board, including rotations and reflections.\n", BOARD_DIM, BOARD_DIM);
+#if BOARD_DIM == 6
+    fprintf(f, "The expected result is 6637920 tours.\n");
+#elif BOARD_DIM == 5
+    fprintf(f, "The expected result is 1728 tours.\n");
 #endif
+#endif
+
+    fprintf(f, "\n");
+    fprintf(f, "Compile-time options:\n");
+    fprintf(f, "    Board size: %d*%d (%d squares)\n", BOARD_DIM, BOARD_DIM, NUM_SQUARES);
+#if ENFORCE_SUM_RULE
+    fprintf(f, "    Each half-row and half-column must sum to: %d\n", LINE_SUM);
+
+#if LAST_SPACE_OPTIMISATION
+    fprintf(f, "    Last space in line optimisation: on.\n");
+#else
+    fprintf(f, "    Last space in line optimisation: off.\n");
+#endif
+
+#else
+    fprintf(f, "    No requirement on row or column sum.\n");
+#endif
+
+#if TOUR_TEST
+    fprintf(f, "    Starting squares: any.\n");
+    fprintf(f, "    Ending squares: any.\n");
+#elif RESTRICT_START_AND_END
+    fprintf(f, "    Starting squares: top half of leftmost column.\n");
+    fprintf(f, "    Ending squares: rightmost column.\n");
+#else
+    fprintf(f, "    Starting squares: any in lower-left diagonal half of top-left quadrant.\n");
+    fprintf(f, "    Ending squares: any.\n");
+#endif
+
     fprintf(f, "\n");
     fprintf(f, "Usage: knighterrant [options]\n");
     fprintf(f, "Options:\n");
@@ -925,18 +1021,37 @@ print_help(FILE *f) {
 }
 
 int main(int argc, char **argv) {
-    SQUARE start_square = 0;
     int num_threads = 4;
     int steps_before_parallelism = 4;
+    int num_starting_squares = 0;
 #if BOARD_DIM == 8
+
+#if RESTRICT_START_AND_END
     /* Only start on squares 0, 8, 16 and 24, the four squares in the top half
      * of the leftmost column. */
-    int8_t start_square_step = 8;
-    SQUARE last_square = 24;
+    SQUARE starting_squares[] = { 0, 8, 16, 24 };
+    num_starting_squares = 4;
+#else
+    /* We don't need to try every starting square or we'll just get rotations
+     * and reflections of other solutions. Instead, divide the top-left
+     * quadrant in half diagonally and just start on the squares in one half
+     * of that quadrant, including the squares on the diagonal. Tours starting
+     * from other squares will just be rotations and/or reflections of these. */
+    SQUARE starting_squares[] = { 0, 8, 9, 16, 17, 18, 24, 25, 26, 27 };
+    num_starting_squares = 10;
+
+    /* Note that we'll still get some duplicates, because the above will still
+     * find solutions which start on the diagonal line and are diagonal
+     * reflections of each other. */
+#endif
+
 #else
     /* Test mode: iterate over every square. */
-    int8_t start_square_step = 1;
-    SQUARE last_square = NUM_SQUARES - 1;
+    SQUARE starting_squares[NUM_SQUARES];
+    for (SQUARE i = 0; i < NUM_SQUARES; i++) {
+        starting_squares[i] = i;
+    }
+    num_starting_squares = NUM_SQUARES;
 #endif
     struct worker_thread *worker_threads = NULL;
     struct job_buffer job_buffer;
@@ -972,16 +1087,6 @@ int main(int argc, char **argv) {
     /* Precompute various useful global lookup tables */
     precompute();
 
-#if BOARD_DIM == 8
-    /* If it's an 8*8 board, we make certain assumptions that we're not
-     * finding all tours, we're only finding those that start on the leftmost
-     * column and end on the rightmost column. */
-    if (start_square % 8 != 0) {
-        fprintf(stderr, "start square must be a multiple of 8 (left column of board)\n");
-        exit(1);
-    }
-#endif
-
     printf("Using board size %d*%d and %d threads\n", BOARD_DIM, BOARD_DIM, num_threads);
 
     if (num_threads == 0) {
@@ -1000,7 +1105,8 @@ int main(int argc, char **argv) {
             /* Count how many paths there are up to steps_before_parallelism
              * steps, so our progress output gives an accurate percentage of
              * jobs dequeued / total jobs to do. */
-            for (SQUARE start = start_square; start <= last_square; start += start_square_step) {
+            for (int i = 0; i < num_starting_squares; ++i) {
+                SQUARE start = starting_squares[i];
                 struct ke_pos pos;
                 ke_pos_init(&pos, start);
                 tour(&pos, steps_before_parallelism, count, &num_expected_jobs);
@@ -1024,8 +1130,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (SQUARE start = start_square; start <= last_square; start += start_square_step) {
+    for (int i = 0; i < num_starting_squares; ++i) {
         /* Position the knight on our starting square */
+        SQUARE start = starting_squares[i];
         struct ke_pos pos;
         ke_pos_init(&pos, start);
 
@@ -1053,8 +1160,9 @@ int main(int argc, char **argv) {
 
     printf("\n");
     printf("Found %lld tours\n", num_tours_found);
-    //printf("sum_opt_elim_count %lld\n", sum_opt_elim_count);
-    //printf("last_space_opt_count %lld\n", last_space_opt_count);
+    if (num_closed_tours_found) {
+        printf("    of which %lld are closed tours\n", num_closed_tours_found);
+    }
 
     return 0;
 }
