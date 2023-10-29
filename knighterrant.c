@@ -6,12 +6,11 @@
 #include <assert.h>
 #include <getopt.h>
 #include <errno.h>
-#include <error.h>
 #include <pthread.h>
 
 #include "knighterrant.h"
 
-const SQUARE INVALID_SQUARE = -1;
+static const SQUARE INVALID_SQUARE = -1;
 
 /* Precomputed: for each square, the IDs of the two lines that square is on. */
 LINE square_to_lines[NUM_SQUARES][2];
@@ -732,6 +731,7 @@ print_help(FILE *f) {
     fprintf(f, "\n");
     fprintf(f, "Usage: knighterrant [options]\n");
     fprintf(f, "Options:\n");
+    fprintf(f, "    -h        Show this help.\n");
     fprintf(f, "    -q        Don't show progress output.\n");
     fprintf(f, "    -s <N>    Search N steps deep before handing the state to a worker thread.\n");
     fprintf(f, "    -t <N>    Use N worker threads. If N is 0, -s has no effect.\n");
@@ -844,7 +844,8 @@ int main(int argc, char **argv) {
             worker_threads[i].emit_cookie = NULL;
             ret = pthread_create(&worker_threads[i].thread_id, NULL, ke_worker_thread, &worker_threads[i]);
             if (ret != 0) {
-                error(1, ret, "pthread_create");
+                fprintf(stderr, "pthread_create: %s\n", strerror(ret));
+                exit(1);
             }
         }
     }
@@ -875,6 +876,7 @@ int main(int argc, char **argv) {
         job_buffer_destroy(&job_buffer);
     }
 
+    /* Final output summary */
     printf("\n");
     printf("Found %lld tours\n", num_tours_found);
     if (num_closed_tours_found) {

@@ -68,12 +68,21 @@ typedef uint64_t BOARDBITMAP;
 /* BOARD_DIM lines per quadrant, four quadrants on the board */
 #define NUM_LINES (BOARD_DIM * 4)
 
+#if BOARD_DIM % 2 != 0 && ENFORCE_SUM_RULE
+#error "Can't enforce half-row and half column sum if board side length is odd"
+#endif
+
 /* Each half-row and half column must sum to half the magic constant for the
  * whole square. The magic constant for the whole square is the sum of the
- * numbers from 1 to NUM_SQUARES divided by the number of rows:
- *    (((1 + NUM_SQUARES) * NUM_SQUARES) / 2) / BOARD_DIM
+ * numbers from 1 to NUM_SQUARES divided by the number of rows, so the half-row
+ * sum is half that:
+ *    ((((1 + NUM_SQUARES) * NUM_SQUARES) / 2) / BOARD_DIM) / 2
+ * simplifying:
+ *    ((1 + NUM_SQUARES) * NUM_SQUARES) / (4 * BOARD_DIM)
+ * NUM_SQUARES = BOARD_DIM * BOARD_DIM, so this simplifies to:
+ *    ((1 + NUM_SQUARES) * BOARD_DIM) / 4
  */
-#define LINE_SUM (((((1 + NUM_SQUARES) * NUM_SQUARES) / 2) / BOARD_DIM)) / 2
+#define LINE_SUM (((1 + NUM_SQUARES) * BOARD_DIM) / 4)
 #define LINE_LENGTH (BOARD_DIM / 2)
 
 /* Define the set of squares on which the tour is permitted to finish. */
@@ -127,7 +136,10 @@ typedef uint64_t BOARDBITMAP;
 #define bb_unset(bp, sq) *(bp) &= ~(1ULL << (sq))
 #define bb_test(b, sq) (((b) & (1ULL << (sq))) != 0)
 
-
+/* The state of a partial path, which contains the current position of the
+ * knight, the position of all the numbers already placed, and various sums
+ * and other statistics that help us determine when a path can no longer lead
+ * to a solution. */
 struct ke_pos {
     /* For each line, the sum of the numbers currently present in that line. */
     short line_sum[NUM_LINES];
